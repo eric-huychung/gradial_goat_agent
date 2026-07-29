@@ -7,7 +7,7 @@ import jeopardy as jp
 
 from config import AgentConfig
 from solver import NaiveSolver
-from tile_selector import TileSelector
+from tile_selector import LowestPointsFirstSelector, TileSelector
 
 
 class AgentRunner:
@@ -18,7 +18,7 @@ class AgentRunner:
     def __init__(self, config: AgentConfig, selector: TileSelector | None = None,
                  solver: NaiveSolver | None = None) -> None:
         self._config = config
-        self._selector = selector or TileSelector(config)
+        self._selector = selector or LowestPointsFirstSelector(config)
         self._solver = solver or NaiveSolver(config)
 
     def run(self) -> int:
