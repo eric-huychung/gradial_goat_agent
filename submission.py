@@ -57,14 +57,35 @@ class SubmissionQueue:
     async def _run(self) -> None:
         while True:
             task_id, answer, fut = await self._queue.get()
-            wait = self.MIN_INTERVAL_SECONDS - (time.monotonic() - self._last_submit)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._last_submit = time.monotonic()
             try:
-                result = await asyncio.to_thread(jp.submit, task_id, answer)
+                result = await self._submit_with_retries(task_id, answer)
                 fut.set_result(result)
             except Exception as e:                          # noqa: BLE001
                 fut.set_exception(e)
             finally:
                 self._queue.task_done()
+
+    async def _submit_with_retries(self, task_id: str, answer: str) -> dict:
+        """One submit, retried on `rate_limited`.
+
+        Our own pacing keeps us under MIN_INTERVAL_SECONDS, but the limit is
+        per-team, not per-process — another agent instance on the same key
+        (or a restarted run) can still trip it. `rate_limited` responses
+        carry `retry_in`; honor it rather than donating the tile as a loss.
+        """
+        for attempt in range(self.MAX_RATE_LIMIT_RETRIES + 1):
+            wait = self.MIN_INTERVAL_SECONDS - (time.monotonic() - self._last_submit)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_submit = time.monotonic()
+
+            result = await asyncio.to_thread(jp.submit, task_id, answer)
+            if result.get("result") != "rate_limited":
+                return result
+            if attempt == self.MAX_RATE_LIMIT_RETRIES:
+                return result
+            retry_in = float(result.get("retry_in") or self.MIN_INTERVAL_SECONDS)
+            jp.log(f"{task_id}: rate_limited, retrying in {retry_in}s "
+                   f"(attempt {attempt + 1}/{self.MAX_RATE_LIMIT_RETRIES})")
+            await asyncio.sleep(retry_in)
+        return result
