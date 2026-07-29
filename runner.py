@@ -15,8 +15,9 @@ import jeopardy as jp
 from config import AgentConfig
 from monitor import MONITOR
 from solver import NaiveSolver
+from strategy import TierPrioritySelector
 from submission import SubmissionQueue
-from tile_selector import LowestPointsFirstSelector, TileSelector
+from tile_selector import TileSelector
 
 
 class AgentRunner:
@@ -26,9 +27,14 @@ class AgentRunner:
                  solver: NaiveSolver | None = None,
                  submission_queue: SubmissionQueue | None = None) -> None:
         self._config = config
-        self._selector = selector or LowestPointsFirstSelector(config)
+        self._selector = selector or TierPrioritySelector(config)
         self._queue = submission_queue or SubmissionQueue()
-        self._solver = solver or NaiveSolver(config, self._queue)
+        # book/claims are strategy.py's bookkeeping — a plain TileSelector
+        # (no such attributes) leaves the solver to run without them.
+        self._solver = solver or NaiveSolver(
+            config, self._queue,
+            book=getattr(self._selector, "book", None),
+            claims=getattr(self._selector, "claims", None))
 
     async def run(self) -> int:
         """Attempt this pass's tiles. Returns how many were solved."""

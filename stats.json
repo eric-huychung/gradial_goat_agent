@@ -1,41 +1,10 @@
 {
   "summary": {
-    "tiles_attempted": 3,
-    "tiles_answered": 2,
-    "tiles_correct": 1,
-    "total_seconds": 649.5428969999994,
-    "avg_seconds": 216.5142989999998
+    "tiles_attempted": 0,
+    "tiles_answered": 0,
+    "tiles_correct": 0,
+    "total_seconds": 0,
+    "avg_seconds": 0.0
   },
-  "tiles": [
-    {
-      "task_id": "PR-C2-2",
-      "category": "Cryptic",
-      "points": 200,
-      "turns_taken": 8,
-      "answered": true,
-      "correct": true,
-      "error": null,
-      "elapsed_seconds": 133.25585941700047
-    },
-    {
-      "task_id": "PR-A2",
-      "category": "Ancient Scrolls",
-      "points": 200,
-      "turns_taken": 12,
-      "answered": false,
-      "correct": false,
-      "error": null,
-      "elapsed_seconds": 226.19335883299937
-    },
-    {
-      "task_id": "PR-H2-2",
-      "category": "Heavy Compute",
-      "points": 200,
-      "turns_taken": 8,
-      "answered": true,
-      "correct": false,
-      "error": null,
-      "elapsed_seconds": 290.0936787499995
-    }
-  ]
+  "tiles": []
 }

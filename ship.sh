@@ -23,6 +23,7 @@ FILES=(
   monitor.py
   runner.py
   solver.py
+  strategy.py
   submission.py
   tile_selector.py
   tools.py

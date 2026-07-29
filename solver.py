@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import os
 import pathlib
+from typing import TYPE_CHECKING
 
 import jeopardy as jp
 
@@ -35,6 +36,9 @@ from config import AgentConfig
 from monitor import TraceRecord
 from submission import SubmissionQueue
 from tools import TOOL_SCHEMAS, Toolbox
+
+if TYPE_CHECKING:                    # avoid a hard runtime dependency
+    from strategy import ClaimWatch, TileBook
 
 
 def _async_anthropic_client():
@@ -62,13 +66,28 @@ class NaiveSolver:
     MAX_TURNS = 12             # tool round-trips before we give up on a tile
 
     def __init__(self, config: AgentConfig, submission_queue: SubmissionQueue,
-                 client=None) -> None:
+                 client=None, book: "TileBook | None" = None,
+                 claims: "ClaimWatch | None" = None) -> None:
         self._config = config
         self._queue = submission_queue
         self._client = client
+        # Both optional: without them the solver just skips bookkeeping and
+        # mid-solve claim checks, it doesn't fail.
+        self._book = book
+        self._claims = claims
 
     async def solve(self, task_id: str, trace: TraceRecord | None = None) -> bool:
         """Attempt one tile. True if the server scored it correct."""
+        if self._book is not None:
+            self._book.start(task_id)
+        try:
+            return await self._solve(task_id, trace)
+        except Exception:
+            if self._book is not None:
+                self._book.record_abandon(task_id, reason="raised")
+            raise
+
+    async def _solve(self, task_id: str, trace: TraceRecord | None = None) -> bool:
         detail = await asyncio.to_thread(jp.task, task_id)
         workdir = jp.workdir(task_id)          # stable; see jeopardy.workdir
         names = await asyncio.to_thread(jp.fetch_files, task_id, detail)
@@ -88,7 +107,10 @@ class NaiveSolver:
             trace.turns_taken = turns
             trace.answered = answer is not None
         if answer is None:
-            jp.log(f"{task_id}: no answer after {self.MAX_TURNS} turns")
+            reason = "turn cap" if turns >= self.MAX_TURNS else "claimed elsewhere"
+            jp.log(f"{task_id}: no answer ({reason}, {turns} turns)")
+            if self._book is not None:
+                self._book.record_abandon(task_id, reason=reason)
             return False
 
         return await self._submit(task_id, answer)
@@ -143,6 +165,10 @@ class NaiveSolver:
         messages: list[dict] = [{"role": "user", "content": prompt}]
 
         for turn in range(self.MAX_TURNS):
+            if self._claims is not None and self._claims.is_taken(task_id):
+                jp.log(f"{task_id}: claimed elsewhere mid-solve, dropping")
+                return None, turn
+
             resp = await self._anthropic.messages.create(
                 model=jp.MODEL,
                 max_tokens=self.MAX_TOKENS,
@@ -202,6 +228,8 @@ class NaiveSolver:
         jp.log(f"{task_id}: answered {answer[:60]!r} -> {result.get('result')}")
         if self._config.verbose:
             jp.log(f"{task_id} full submit response: {result}")
+        if self._book is not None:
+            self._book.record_result(task_id, result)
         if result.get("result") == "forbidden":
             jp.log("  (a scored round is live — only your HOSTED agent may "
                    "submit. Deploy with /api/agent/submit, or practise on the "

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 class AgentConfig:
     verbose: bool = False
     task_filter: tuple[str, ...] = ()
-    max_tiles: int = 10
+    max_tiles: int = 60
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> AgentConfig:
