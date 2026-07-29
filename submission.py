@@ -24,6 +24,7 @@ class SubmissionQueue:
     """
 
     MIN_INTERVAL_SECONDS = 3.1
+    MAX_RATE_LIMIT_RETRIES = 5     # server's global limit, not just ours
 
     def __init__(self) -> None:
         self._queue: asyncio.Queue[tuple[str, str, asyncio.Future]] = asyncio.Queue()

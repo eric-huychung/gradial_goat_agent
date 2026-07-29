@@ -1,81 +1,21 @@
 {
   "summary": {
-    "tiles_attempted": 10,
-    "tiles_answered": 9,
-    "tiles_correct": 9,
-    "total_seconds": 1351.5661075400003,
-    "avg_seconds": 135.15661075400004
+    "tiles_attempted": 3,
+    "tiles_answered": 2,
+    "tiles_correct": 1,
+    "total_seconds": 649.5428969999994,
+    "avg_seconds": 216.5142989999998
   },
   "tiles": [
-    {
-      "task_id": "PR-W2-2",
-      "category": "The Dark Web",
-      "points": 200,
-      "turns_taken": 5,
-      "answered": true,
-      "correct": true,
-      "error": null,
-      "elapsed_seconds": 30.886823791001007
-    },
-    {
-      "task_id": "PR-H3-2",
-      "category": "Heavy Compute",
-      "points": 300,
-      "turns_taken": 3,
-      "answered": true,
-      "correct": true,
-      "error": null,
-      "elapsed_seconds": 57.593501166998976
-    },
-    {
-      "task_id": "PR-A3-2",
-      "category": "Ancient Scrolls",
-      "points": 300,
-      "turns_taken": 6,
-      "answered": true,
-      "correct": true,
-      "error": null,
-      "elapsed_seconds": 86.64665824999975
-    },
-    {
-      "task_id": "PR-N2-2",
-      "category": "Needle in the Haystack",
-      "points": 200,
-      "turns_taken": 6,
-      "answered": true,
-      "correct": true,
-      "error": null,
-      "elapsed_seconds": 89.7455216670005
-    },
-    {
-      "task_id": "PR-S2-2",
-      "category": "Ship It",
-      "points": 200,
-      "turns_taken": 9,
-      "answered": true,
-      "correct": true,
-      "error": null,
-      "elapsed_seconds": 120.12847204100035
-    },
     {
       "task_id": "PR-C2-2",
       "category": "Cryptic",
       "points": 200,
-      "turns_taken": 9,
+      "turns_taken": 8,
       "answered": true,
       "correct": true,
       "error": null,
-      "elapsed_seconds": 147.62054620900017
-    },
-    {
-      "task_id": "PR-H2-2",
-      "category": "Heavy Compute",
-      "points": 200,
-      "turns_taken": 6,
-      "answered": true,
-      "correct": true,
-      "error": null,
-      "elapsed_seconds": 180.63243266599966
+      "elapsed_seconds": 133.25585941700047
     },
     {
       "task_id": "PR-A2",
@@ -85,27 +25,17 @@
       "answered": false,
       "correct": false,
       "error": null,
-      "elapsed_seconds": 210.85571587499908
+      "elapsed_seconds": 226.19335883299937
     },
     {
-      "task_id": "PR-N3-2",
-      "category": "Needle in the Haystack",
-      "points": 300,
-      "turns_taken": 11,
+      "task_id": "PR-H2-2",
+      "category": "Heavy Compute",
+      "points": 200,
+      "turns_taken": 8,
       "answered": true,
-      "correct": true,
+      "correct": false,
       "error": null,
-      "elapsed_seconds": 212.17298995800047
-    },
-    {
-      "task_id": "PR-C3-2",
-      "category": "Cryptic",
-      "points": 300,
-      "turns_taken": 7,
-      "answered": true,
-      "correct": true,
-      "error": null,
-      "elapsed_seconds": 215.28344591600035
+      "elapsed_seconds": 290.0936787499995
     }
   ]
 }
