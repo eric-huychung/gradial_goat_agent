@@ -1,12 +1,15 @@
-"""Solving a single tile — a tool-using agent loop, not one blind guess.
+"""Solving a single tile — an async, tool-using agent loop.
 
 The naive baseline handed the prompt to the model and submitted whatever came
 back. It scored zero because the model cannot see the downloaded files, run
 code, or open a page — so it hallucinated confident, wrong answers.
 
-``NaiveSolver`` now gives the model hands (``tools.py``) and a loop: it can
-read the files, compute, and probe web endpoints, feeding each result back
-until it has a real answer. Two things protect the score:
+``NaiveSolver`` gives the model hands (``tools.py``) and a loop: it can read
+the files, compute, and probe web endpoints, feeding each result back until it
+has a real answer. It is async so many tiles can be IN FLIGHT at once —
+solving has no rate limit, only submitting does — and each solve's model
+calls and tool runs (subprocess, HTTP) are awaited without blocking the
+others. Two things protect the score:
 
 - **Structural answer pass-through.** The model computes the answer in
   ``run_python`` and prints ``__ANSWER__=<value>``; that captured string is
@@ -14,15 +17,36 @@ until it has a real answer. Two things protect the score:
   cannot fumble a character on a tile it already solved (README: "Never let
   the model retype an exact-match answer").
 - **A turn cap.** A stuck tile can't burn the whole budget.
+
+Submission itself is NOT done here directly — every solve hands its final
+answer to a shared ``SubmissionQueue`` (see ``submission.py``), which is the
+one place that respects the server's one-submission-per-3-seconds limit
+across every tile solving concurrently.
 """
 from __future__ import annotations
 
+import asyncio
+import os
 import pathlib
 
 import jeopardy as jp
 
 from config import AgentConfig
+from monitor import TraceRecord
+from submission import SubmissionQueue
 from tools import TOOL_SCHEMAS, Toolbox
+
+
+def _async_anthropic_client():
+    """An AsyncAnthropic client pointed at the same proxy as jp.anthropic_client().
+
+    Built here (not in jeopardy.py) purely so many tiles can await model
+    calls concurrently; same env vars, same proxy, same forced model.
+    """
+    from anthropic import AsyncAnthropic
+    return AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", jp.KEY),
+                          base_url=os.environ.get("ANTHROPIC_BASE_URL",
+                                                  f"{jp.BASE}/anthropic"))
 
 
 class NaiveSolver:
@@ -30,21 +54,28 @@ class NaiveSolver:
 
     Loop: send the prompt + tool schemas, run whatever tool the model asks
     for, feed the result back, repeat until it calls ``submit_answer`` or the
-    turn cap is hit.
+    turn cap is hit. Submission is queued, not sent directly, so concurrent
+    solves never violate the server's submission rate limit.
     """
 
     MAX_TOKENS = 4096          # the proxy's cap; use it all
     MAX_TURNS = 12             # tool round-trips before we give up on a tile
 
-    def __init__(self, config: AgentConfig, client=None) -> None:
+    def __init__(self, config: AgentConfig, submission_queue: SubmissionQueue,
+                 client=None) -> None:
         self._config = config
+        self._queue = submission_queue
         self._client = client
 
-    def solve(self, task_id: str) -> bool:
+    async def solve(self, task_id: str, trace: TraceRecord | None = None) -> bool:
         """Attempt one tile. True if the server scored it correct."""
-        detail = jp.task(task_id)
+        detail = await asyncio.to_thread(jp.task, task_id)
         workdir = jp.workdir(task_id)          # stable; see jeopardy.workdir
-        names = jp.fetch_files(task_id, detail)
+        names = await asyncio.to_thread(jp.fetch_files, task_id, detail)
+
+        if trace is not None:
+            trace.category = detail.get("category")
+            trace.points = detail.get("points")
 
         prompt = self._build_prompt(detail, workdir, names)
         if self._config.verbose:
@@ -52,12 +83,15 @@ class NaiveSolver:
                    f"{detail.get('points')}pt) prompt:\n{prompt}\n---")
 
         tools = Toolbox(workdir)
-        answer = self._run_loop(task_id, prompt, tools)
+        answer, turns = await self._run_loop(task_id, prompt, tools)
+        if trace is not None:
+            trace.turns_taken = turns
+            trace.answered = answer is not None
         if answer is None:
             jp.log(f"{task_id}: no answer after {self.MAX_TURNS} turns")
             return False
 
-        return self._submit(task_id, answer)
+        return await self._submit(task_id, answer)
 
     def _build_prompt(self, detail: dict, workdir: pathlib.Path,
                       names: list[str]) -> str:
@@ -103,13 +137,13 @@ class NaiveSolver:
             },
         }
 
-    def _run_loop(self, task_id: str, prompt: str,
-                  tools: Toolbox) -> str | None:
+    async def _run_loop(self, task_id: str, prompt: str,
+                        tools: Toolbox) -> tuple[str | None, int]:
         schemas = TOOL_SCHEMAS + [self._submit_tool_schema()]
         messages: list[dict] = [{"role": "user", "content": prompt}]
 
         for turn in range(self.MAX_TURNS):
-            resp = self._anthropic.messages.create(
+            resp = await self._anthropic.messages.create(
                 model=jp.MODEL,
                 max_tokens=self.MAX_TOKENS,
                 messages=messages,
@@ -124,28 +158,30 @@ class NaiveSolver:
                                if b.type == "text").strip()
                 if self._config.verbose:
                     jp.log(f"{task_id} turn {turn}: no tool, text={text!r}")
-                return text or None
+                return text or None, turn + 1
 
             results = []
             for tu in tool_uses:
                 if tu.name == "submit_answer":
                     answer = self._resolve_answer(tu.input or {}, tools)
                     if answer is not None:
-                        return answer
+                        return answer, turn + 1
                     results.append(self._tool_result(
                         tu.id,
                         "[error] no computed answer captured yet — run "
                         "run_python and print '__ANSWER__=<value>' first."))
                     continue
 
-                out = tools.run(tu.name, tu.input or {})
+                # tools.run is blocking (subprocess/HTTP) — off the event
+                # loop so other tiles' turns keep making progress meanwhile.
+                out = await asyncio.to_thread(tools.run, tu.name, tu.input or {})
                 if self._config.verbose:
                     jp.log(f"{task_id} turn {turn}: {tu.name} -> {out[:200]!r}")
                 results.append(self._tool_result(tu.id, out))
 
             messages.append({"role": "user", "content": results})
 
-        return None
+        return None, self.MAX_TURNS
 
     @staticmethod
     def _resolve_answer(args: dict, tools: Toolbox) -> str | None:
@@ -159,8 +195,10 @@ class NaiveSolver:
         return {"type": "tool_result", "tool_use_id": tool_use_id,
                 "content": content}
 
-    def _submit(self, task_id: str, answer: str) -> bool:
-        result = jp.submit(task_id, answer)
+    async def _submit(self, task_id: str, answer: str) -> bool:
+        # Funnels through the shared queue: many tiles finish concurrently,
+        # but only one submission goes out every MIN_INTERVAL_SECONDS.
+        result = await self._queue.submit(task_id, answer)
         jp.log(f"{task_id}: answered {answer[:60]!r} -> {result.get('result')}")
         if self._config.verbose:
             jp.log(f"{task_id} full submit response: {result}")
@@ -174,5 +212,5 @@ class NaiveSolver:
     def _anthropic(self):
         # Built on first use so a pass that picks no tiles needs no client.
         if self._client is None:
-            self._client = jp.anthropic_client()
+            self._client = _async_anthropic_client()
         return self._client

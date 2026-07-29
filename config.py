@@ -14,7 +14,7 @@ from dataclasses import dataclass
 class AgentConfig:
     verbose: bool = False
     task_filter: tuple[str, ...] = ()
-    max_tiles: int = 3
+    max_tiles: int = 10
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> AgentConfig:
@@ -24,5 +24,5 @@ class AgentConfig:
             verbose=env.get("VERBOSE") == "1",
             task_filter=tuple(t.strip() for t in raw_filter.split(",")
                               if t.strip()),
-            max_tiles=int(env.get("MAX_TILES", "3")),
+            max_tiles=int(env.get("MAX_TILES", AgentConfig.max_tiles)),
         )

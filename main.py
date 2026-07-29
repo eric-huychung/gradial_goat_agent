@@ -67,18 +67,20 @@ WHERE THINGS LIVE
 """
 from __future__ import annotations
 
+import asyncio
+
 import jeopardy as jp
 
 from config import AgentConfig
 from runner import AgentRunner
 
 
-def main() -> None:
-    AgentRunner(AgentConfig.from_env()).run()
+async def main() -> None:
+    await AgentRunner(AgentConfig.from_env()).run()
 
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except jp.AuthError as e:
         raise SystemExit(f"[auth] {e}")
