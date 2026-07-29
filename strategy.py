@@ -27,6 +27,20 @@ drive the ranking:
 Everything degrades instead of raising: a failed observation or a bad score
 falls back to board order rather than taking the pass down with it.
 
+HOOKS THE SOLVER SHOULD CALL
+----------------------------
+Ranking works on board data alone, so none of this is required — but without
+it the selector cannot tell a solved tile from an unattempted one:
+
+    selector.book.start(task_id)                 # before solving
+    selector.book.record_result(task_id, resp)   # the jp.submit response
+    selector.book.record_abandon(task_id)        # gave up without submitting
+    selector.claims.is_taken(task_id)            # between tool turns -> stop
+
+`record_abandon` is the one that is easy to miss: a solver that hits its turn
+cap returns without submitting, so no server response exists to report, and an
+unreported tile keeps full priority and is re-picked immediately, forever.
+
 Calibrate on the practice board without submitting anything:
 
     python strategy.py            # one board report
@@ -79,6 +93,19 @@ PER_CELL_CAP = 2
 # Local cooldown after a miss. The server's own cooldown is authoritative
 # (`retry_in`); this is the floor used when it doesn't say.
 DEFAULT_RETRY_SECONDS = 30.0
+
+# A tile the solver gave up on (turn cap, timeout) is parked this long. Long
+# enough that workers move on to tiles that pay sooner, short enough that it
+# comes back inside the round — an abandoned tile is a donated tile.
+ABANDON_RETRY_SECONDS = 120.0
+# Score multiplier per abandon. Below 1 so repeatedly-slow tiles sink, never 0
+# so they stay reachable once the quick tiles run out.
+ABANDON_PENALTY = 0.6
+
+# How stale a claim check may be before `ClaimWatch` re-reads the board. The
+# board read is shared by every worker, so this is a per-agent cost, not a
+# per-tile one.
+CLAIM_REFRESH_SECONDS = 5.0
 
 
 def _tier_weight(points: int) -> float:
@@ -171,12 +198,71 @@ class BoardWatcher:
         return ranked[:limit]
 
 
+# ---- mid-solve claim checking ---------------------------------------------
+
+class ClaimWatch:
+    """Answers "is this tile still worth finishing?" during a solve.
+
+    Selection-time filtering is not enough: tiles are first-correct-wins, so a
+    tile can be taken by another team while we are ten tool-turns into it, and
+    every turn after that is spent buying nothing. A solver that checks this
+    between turns can drop the tile and free the worker.
+
+    The board read is cached for `CLAIM_REFRESH_SECONDS` and shared by every
+    caller, so polling this per tool-turn costs one request every few seconds
+    rather than one per turn.
+
+    Fails OPEN: if the board cannot be read, tiles are reported still open. A
+    network blip must not throw away work that is nearly finished.
+    """
+
+    def __init__(self, refresh_seconds: float = CLAIM_REFRESH_SECONDS) -> None:
+        self._refresh_seconds = refresh_seconds
+        self._open_ids: set[str] | None = None
+        self._checked_at = 0.0
+
+    def observe(self, board: dict) -> None:
+        """Reuse a board someone else already fetched."""
+        try:
+            self._open_ids = {t["id"] for t in jp.open_tiles(board)}
+            self._checked_at = time.monotonic()
+        except Exception as e:                                  # noqa: BLE001
+            jp.log(f"claimwatch: board unreadable, assuming all open — {e!r}")
+
+    def _refresh_if_stale(self) -> None:
+        if (self._open_ids is not None
+                and time.monotonic() - self._checked_at < self._refresh_seconds):
+            return
+        try:
+            self.observe(jp.board())
+        except jp.AuthError:
+            raise                                   # fatal; not our call
+        except Exception as e:                                  # noqa: BLE001
+            jp.log(f"claimwatch: board fetch failed, assuming all open — {e!r}")
+            self._checked_at = time.monotonic()     # don't hammer a dead server
+
+    def is_open(self, task_id: str) -> bool:
+        self._refresh_if_stale()
+        if not self._open_ids:
+            # Empty, not just None. A malformed board parses to zero open
+            # tiles without raising, and reading that as "everything is taken"
+            # would abandon every solve in flight. A board that really is
+            # empty costs one `already_claimed` per submit, which is free.
+            return True
+        return task_id in self._open_ids
+
+    def is_taken(self, task_id: str) -> bool:
+        return not self.is_open(task_id)
+
+
 # ---- per-tile bookkeeping -------------------------------------------------
 
 @dataclass
 class TileRecord:
     attempts: int = 0
     misses: int = 0
+    abandons: int = 0
+    slowest_seconds: float = 0.0
     retry_at: float = 0.0
     done: bool = False
 
@@ -192,16 +278,41 @@ class TileBook:
 
     records: dict[str, TileRecord] = field(default_factory=dict)
     in_progress: set[str] = field(default_factory=set)
+    started_at: dict[str, float] = field(default_factory=dict)
 
     def _record(self, task_id: str) -> TileRecord:
         return self.records.setdefault(task_id, TileRecord())
 
     def start(self, task_id: str) -> None:
         self.in_progress.add(task_id)
+        self.started_at[task_id] = time.monotonic()
         self._record(task_id).attempts += 1
 
     def finish(self, task_id: str) -> None:
         self.in_progress.discard(task_id)
+        self.started_at.pop(task_id, None)
+
+    def elapsed(self, task_id: str) -> float:
+        """Seconds the current attempt has been running, 0 if not running."""
+        started = self.started_at.get(task_id)
+        return 0.0 if started is None else time.monotonic() - started
+
+    def record_abandon(self, task_id: str, reason: str = "gave up") -> None:
+        """The solver stopped without submitting — turn cap, timeout, crash.
+
+        This is the case `record_result` never sees: no submission means no
+        server response, so without this the tile keeps its full score and is
+        re-picked on the very next pass, at the same cost, forever. Park it
+        instead, and let it come back when the cheap work is gone.
+        """
+        record = self._record(task_id)
+        record.abandons += 1
+        record.slowest_seconds = max(record.slowest_seconds,
+                                     self.elapsed(task_id))
+        record.retry_at = time.monotonic() + ABANDON_RETRY_SECONDS
+        self.finish(task_id)
+        jp.log(f"{task_id}: parked for {ABANDON_RETRY_SECONDS:.0f}s "
+               f"({reason}, {record.abandons} so far)")
 
     def record_result(self, task_id: str, result: dict | str) -> None:
         """Feed a `jp.submit` response (or bare result string) back in."""
@@ -211,7 +322,9 @@ class TileBook:
             retry_in = result.get("retry_in")
         outcome = result.get("result")
         record = self._record(task_id)
-        self.in_progress.discard(task_id)
+        record.slowest_seconds = max(record.slowest_seconds,
+                                     self.elapsed(task_id))
+        self.finish(task_id)
 
         if outcome in ("correct", "already_claimed", "voided"):
             record.done = True
@@ -235,6 +348,10 @@ class TileBook:
     def miss_count(self, task_id: str) -> int:
         record = self.records.get(task_id)
         return record.misses if record else 0
+
+    def abandon_count(self, task_id: str) -> int:
+        record = self.records.get(task_id)
+        return record.abandons if record else 0
 
 
 # ---- the selector ---------------------------------------------------------
@@ -260,35 +377,43 @@ class TierPrioritySelector(TileSelector):
 
     def __init__(self, config: AgentConfig,
                  watcher: BoardWatcher | None = None,
-                 book: TileBook | None = None) -> None:
+                 book: TileBook | None = None,
+                 claims: ClaimWatch | None = None) -> None:
         super().__init__(config)
         self.watcher = watcher or BoardWatcher()
         self.book = book or TileBook()
+        # Shared with the solver so mid-solve claim checks reuse these reads.
+        self.claims = claims or ClaimWatch()
 
     def select(self, board: dict) -> list[str]:
         try:
             self.watcher.observe(board)
+            self.claims.observe(board)
         except Exception as e:                              # noqa: BLE001
             jp.log(f"strategy: contention read failed, ignoring — {e!r}")
         return super().select(board)
 
     def _choose(self, tiles: list[dict]) -> list[str]:
         try:
-            picked = [s.task_id for s in self.rank(tiles)]
+            ranked = self.rank(tiles)
         except Exception as e:                              # noqa: BLE001
             # Board order is a worse plan than the ranking, and a far better
-            # one than an empty pass.
+            # one than an empty pass. `.get` because this path exists for
+            # malformed tiles, and must not fail on one too.
             jp.log(f"strategy: ranking failed, using board order — {e!r}")
-            return [t["id"] for t in tiles[:self._config.max_tiles]]
+            ids = [t.get("id") for t in tiles if t.get("id")]
+            return ids[:self._config.max_tiles]
 
         if self._config.verbose:
-            self._log_ranking(tiles)
-        return picked[:self._config.max_tiles]
+            self._log_ranking(ranked)
+        return [s.task_id for s in ranked[:self._config.max_tiles]]
 
     def rank(self, tiles: list[dict]) -> list[ScoredTile]:
         """Every pickable tile, best first, respecting `PER_CELL_CAP`."""
+        # A tile with no usable id would be scored, picked, and submitted as an
+        # empty task_id, so drop it here rather than at the server.
         scored = [self.score(t) for t in tiles
-                  if self.book.is_available(t.get("id", ""))]
+                  if t.get("id") and self.book.is_available(t["id"])]
         # Stable: equal scores keep the server's own ordering, whose leading
         # variants are the ones it pre-generates and serves fastest.
         scored.sort(key=lambda s: -s.score)
@@ -318,12 +443,16 @@ class TierPrioritySelector(TileSelector):
         # Each miss halves the tile's pull without ever removing it: the
         # cooldown already delays it, and a tile we drop is a tile we gift.
         score *= 0.5 ** self.book.miss_count(task_id)
+        # Same idea for tiles the solver has already run out of turns on: they
+        # sink below fresh work, then resurface once that work is gone.
+        score *= ABANDON_PENALTY ** self.book.abandon_count(task_id)
 
         return ScoredTile(task_id=task_id, category=category, points=points,
                           score=score, heat=heat, availability=availability)
 
-    def _log_ranking(self, tiles: list[dict], limit: int = 8) -> None:
-        for tile in self.rank(tiles)[:limit]:
+    @staticmethod
+    def _log_ranking(ranked: list[ScoredTile], limit: int = 8) -> None:
+        for tile in ranked[:limit]:
             jp.log(f"  {tile.task_id:>8} {tile.points:>4}pt "
                    f"score={tile.score:.3f} heat={tile.heat:.2f} "
                    f"avail={tile.availability:.2f} {tile.category}")
