@@ -35,7 +35,7 @@ it the selector cannot tell a solved tile from an unattempted one:
     selector.book.start(task_id)                 # before solving
     selector.book.record_result(task_id, resp)   # the jp.submit response
     selector.book.record_abandon(task_id)        # gave up without submitting
-    selector.claims.is_taken(task_id)            # between tool turns -> stop
+    await selector.claims.is_taken(task_id)      # between tool turns -> stop
 
 `record_abandon` is the one that is easy to miss: a solver that hits its turn
 cap returns without submitting, so no server response exists to report, and an
@@ -48,6 +48,8 @@ Calibrate on the practice board without submitting anything:
 """
 from __future__ import annotations
 
+import asyncio
+import random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -86,13 +88,27 @@ HEAT_PENALTY = 0.35
 SCARCITY_PENALTY = 0.25
 
 # Workers on variants of the same cell. Stacked tiles are independent, so >1
-# is legal — but sibling variants are near-identical difficulty, so spreading
-# wide is the better bet until a category is known-good.
-PER_CELL_CAP = 2
+# is legal — but sibling variants are near-identical difficulty, and our solve
+# is slow relative to other teams' agents, so a second worker on the same
+# cell is a second worker likely to arrive after it is already gone. Spread
+# wide across cells instead of doubling up.
+PER_CELL_CAP = 1
 
 # Local cooldown after a miss. The server's own cooldown is authoritative
 # (`retry_in`); this is the floor used when it doesn't say.
 DEFAULT_RETRY_SECONDS = 30.0
+
+# Assumed solve time before we have real data of our own, seconds. This
+# agent is slower than the field, so guess pessimistic rather than instant —
+# `TileBook.average_solve_seconds` replaces this with a measured value the
+# moment a handful of tiles have actually finished.
+DEFAULT_SOLVE_SECONDS = 90.0
+
+# How hard "will this cell still have stock once our slow solve finishes"
+# pulls the score down. 0 ignores our own speed entirely (the old behaviour);
+# 1 lets a cell projected to fully drain before we'd finish score at zero,
+# however good its tier/category weight looks right now.
+SURVIVAL_WEIGHT = 0.8
 
 # A tile the solver gave up on (turn cap, timeout) is parked this long. Long
 # enough that workers move on to tiles that pay sooner, short enough that it
@@ -106,6 +122,11 @@ ABANDON_PENALTY = 0.6
 # board read is shared by every worker, so this is a per-agent cost, not a
 # per-tile one.
 CLAIM_REFRESH_SECONDS = 5.0
+
+# `GreedyBreadthSelector` only. Shuffling cell and variant order means two
+# passes (or two agents on the same board) don't queue up behind the same
+# tiles in the same order, which is where first-solve-wins races are lost.
+GREEDY_SHUFFLE = True
 
 
 def _tier_weight(points: int) -> float:
@@ -150,6 +171,20 @@ class CellHistory:
         if HEAT_REFERENCE_PER_MIN <= 0:
             return 0.0
         return min(1.0, self.drain_per_min / HEAT_REFERENCE_PER_MIN)
+
+    def predicted_survival(self, solve_seconds: float) -> float:
+        """Fraction of the stack expected to still be open `solve_seconds` from now.
+
+        `heat`/`availability` describe the cell as of the last board read;
+        neither says whether it will still exist once OUR solve — slower than
+        the field's — actually finishes. Project the observed drain rate
+        forward by our own solve time instead of reading it as of right now.
+        """
+        if self.total <= 0:
+            return 1.0
+        projected_drained = self.drain_per_min * (solve_seconds / 60.0)
+        predicted_remaining = self.remaining - projected_drained
+        return max(0.0, min(1.0, predicted_remaining / self.total))
 
 
 class BoardWatcher:
@@ -208,9 +243,12 @@ class ClaimWatch:
     every turn after that is spent buying nothing. A solver that checks this
     between turns can drop the tile and free the worker.
 
-    The board read is cached for `CLAIM_REFRESH_SECONDS` and shared by every
-    caller, so polling this per tool-turn costs one request every few seconds
-    rather than one per turn.
+    `is_open`/`is_taken` are coroutines because a stale check refetches the
+    board — doing that behind a synchronous-looking call would stall every
+    other tile on the loop. The board read is cached for
+    `CLAIM_REFRESH_SECONDS` and guarded by a lock, so the dozens of tiles
+    polling this per tool-turn share ONE request every few seconds rather than
+    each firing their own.
 
     Fails OPEN: if the board cannot be read, tiles are reported still open. A
     network blip must not throw away work that is nearly finished.
@@ -220,6 +258,7 @@ class ClaimWatch:
         self._refresh_seconds = refresh_seconds
         self._open_ids: set[str] | None = None
         self._checked_at = 0.0
+        self._lock = asyncio.Lock()
 
     def observe(self, board: dict) -> None:
         """Reuse a board someone else already fetched."""
@@ -229,20 +268,28 @@ class ClaimWatch:
         except Exception as e:                                  # noqa: BLE001
             jp.log(f"claimwatch: board unreadable, assuming all open — {e!r}")
 
-    def _refresh_if_stale(self) -> None:
-        if (self._open_ids is not None
-                and time.monotonic() - self._checked_at < self._refresh_seconds):
-            return
-        try:
-            self.observe(jp.board())
-        except jp.AuthError:
-            raise                                   # fatal; not our call
-        except Exception as e:                                  # noqa: BLE001
-            jp.log(f"claimwatch: board fetch failed, assuming all open — {e!r}")
-            self._checked_at = time.monotonic()     # don't hammer a dead server
+    def _is_fresh(self) -> bool:
+        return (self._open_ids is not None
+                and time.monotonic() - self._checked_at < self._refresh_seconds)
 
-    def is_open(self, task_id: str) -> bool:
-        self._refresh_if_stale()
+    async def _refresh_if_stale(self) -> None:
+        if self._is_fresh():
+            return
+        async with self._lock:
+            # Re-checked inside the lock: while we queued for it, whoever held
+            # it did the fetch, and repeating it is the stampede this avoids.
+            if self._is_fresh():
+                return
+            try:
+                self.observe(await jp.board())
+            except jp.AuthError:
+                raise                               # fatal; not our call
+            except Exception as e:                              # noqa: BLE001
+                jp.log(f"claimwatch: board fetch failed, assuming all open — {e!r}")
+                self._checked_at = time.monotonic()  # don't hammer a dead server
+
+    async def is_open(self, task_id: str) -> bool:
+        await self._refresh_if_stale()
         if not self._open_ids:
             # Empty, not just None. A malformed board parses to zero open
             # tiles without raising, and reading that as "everything is taken"
@@ -251,8 +298,8 @@ class ClaimWatch:
             return True
         return task_id in self._open_ids
 
-    def is_taken(self, task_id: str) -> bool:
-        return not self.is_open(task_id)
+    async def is_taken(self, task_id: str) -> bool:
+        return not await self.is_open(task_id)
 
 
 # ---- per-tile bookkeeping -------------------------------------------------
@@ -345,6 +392,19 @@ class TileBook:
             return False
         return time.monotonic() >= record.retry_at
 
+    def average_solve_seconds(self, default: float = DEFAULT_SOLVE_SECONDS) -> float:
+        """Mean wall time of our own finished solves — how slow "slow" is.
+
+        Self-calibrating: falls back to `default` until enough tiles have
+        actually finished to measure, then reflects this agent's real pace
+        instead of a guess.
+        """
+        finished = [r.slowest_seconds for r in self.records.values()
+                   if r.done and r.slowest_seconds > 0]
+        if not finished:
+            return default
+        return sum(finished) / len(finished)
+
     def miss_count(self, task_id: str) -> int:
         record = self.records.get(task_id)
         return record.misses if record else 0
@@ -364,6 +424,7 @@ class ScoredTile:
     score: float
     heat: float
     availability: float
+    survival: float
 
 
 class TierPrioritySelector(TileSelector):
@@ -436,10 +497,17 @@ class TierPrioritySelector(TileSelector):
         history = self.watcher.history(tile)
         heat = history.heat if history else 0.0
         availability = history.availability if history else 1.0
+        solve_seconds = self.book.average_solve_seconds()
+        survival = (history.predicted_survival(solve_seconds)
+                   if history else 1.0)
 
         score = _tier_weight(points) * _category_weight(category)
         score *= 1.0 - HEAT_PENALTY * heat
         score *= 1.0 - SCARCITY_PENALTY * (1.0 - availability)
+        # Compensates for a slower-than-the-field solve: a cell projected to
+        # drain out before we'd finish is worth approaching zero however good
+        # its tier/category weight looks right now.
+        score *= (1.0 - SURVIVAL_WEIGHT) + SURVIVAL_WEIGHT * survival
         # Each miss halves the tile's pull without ever removing it: the
         # cooldown already delays it, and a tile we drop is a tile we gift.
         score *= 0.5 ** self.book.miss_count(task_id)
@@ -448,20 +516,98 @@ class TierPrioritySelector(TileSelector):
         score *= ABANDON_PENALTY ** self.book.abandon_count(task_id)
 
         return ScoredTile(task_id=task_id, category=category, points=points,
-                          score=score, heat=heat, availability=availability)
+                          score=score, heat=heat, availability=availability,
+                          survival=survival)
 
     @staticmethod
     def _log_ranking(ranked: list[ScoredTile], limit: int = 8) -> None:
         for tile in ranked[:limit]:
             jp.log(f"  {tile.task_id:>8} {tile.points:>4}pt "
                    f"score={tile.score:.3f} heat={tile.heat:.2f} "
-                   f"avail={tile.availability:.2f} {tile.category}")
+                   f"avail={tile.availability:.2f} surv={tile.survival:.2f} "
+                   f"{tile.category}")
+
+
+class GreedyBreadthSelector(TileSelector):
+    """Naive and greedy: touch as many different cells as possible, fast.
+
+    The opposite bet to `TierPrioritySelector`. No tier preference, no
+    contention modelling, no category confidence — every open tile is equally
+    worth trying, so the only question is coverage. Tiles are dealt
+    round-robin across cells: one from every cell first, then a second from
+    every cell, and so on until `max_tiles` runs out. A board of 30 cells and
+    a `max_tiles` of 30 therefore touches all 30 cells rather than emptying
+    six of them.
+
+    Cell and variant order are shuffled per pass (`GREEDY_SHUFFLE`), so a
+    pass that gets cut short by `max_tiles` doesn't cut short at the same
+    place every time, and two agents working the same board don't contend for
+    an identical, identically-ordered queue.
+
+    Useful as a control when the ranked selector is mis-calibrated: if
+    `CATEGORY_WEIGHTS` or the survival projection are steering the agent away
+    from tiles it could actually have taken, this scores better by simply not
+    having an opinion. Swap it in from `runner.py`:
+
+        from strategy import GreedyBreadthSelector
+        self._selector = selector or GreedyBreadthSelector(config)
+
+    Keeps `book`/`claims` so the solver's bookkeeping and mid-solve claim
+    checks wire up exactly as they do for the ranked selector.
+    """
+
+    def __init__(self, config: AgentConfig,
+                 book: TileBook | None = None,
+                 claims: ClaimWatch | None = None,
+                 shuffle: bool = GREEDY_SHUFFLE) -> None:
+        super().__init__(config)
+        self.book = book or TileBook()
+        self.claims = claims or ClaimWatch()
+        self.shuffle = shuffle
+
+    def select(self, board: dict) -> list[str]:
+        try:
+            self.claims.observe(board)
+        except Exception as e:                              # noqa: BLE001
+            jp.log(f"greedy: claim read failed, ignoring — {e!r}")
+        return super().select(board)
+
+    def _choose(self, tiles: list[dict]) -> list[str]:
+        by_cell: dict[tuple, list[str]] = {}
+        for tile in tiles:
+            task_id = tile.get("id")
+            if not task_id or not self.book.is_available(task_id):
+                continue
+            key = (tile.get("category"), tile.get("points"))
+            by_cell.setdefault(key, []).append(task_id)
+
+        cells = list(by_cell.values())
+        if self.shuffle:
+            random.shuffle(cells)
+            for ids in cells:
+                random.shuffle(ids)
+
+        picked: list[str] = []
+        # Deal one tile per cell per round, so coverage is widest-first and a
+        # deep cell never crowds out a cell we haven't touched at all.
+        for depth in range(max((len(v) for v in cells), default=0)):
+            for ids in cells:
+                if depth < len(ids):
+                    picked.append(ids[depth])
+                    if len(picked) >= self._config.max_tiles:
+                        if self._config.verbose:
+                            jp.log(f"greedy: {len(picked)} tiles across "
+                                   f"{len(cells)} cells")
+                        return picked
+        if self._config.verbose:
+            jp.log(f"greedy: {len(picked)} tiles across {len(cells)} cells")
+        return picked
 
 
 # ---- calibration CLI (read-only; submits nothing) ------------------------
 
-def _report(selector: TierPrioritySelector) -> None:
-    board = jp.board()
+async def _report(selector: TierPrioritySelector) -> None:
+    board = await jp.board()
     tiles = jp.open_tiles(board)
     selector.watcher.observe(board)
 
@@ -473,12 +619,15 @@ def _report(selector: TierPrioritySelector) -> None:
     jp.log(f"phase={board.get('phase')}  open tiles={len(tiles)}")
     jp.log("  open per tier: "
            + ", ".join(f"{p}={by_tier[p]}" for p in sorted(by_tier)))
+    jp.log(f"  assumed solve time: {selector.book.average_solve_seconds():.0f}s "
+           f"(measured once tiles finish, else DEFAULT_SOLVE_SECONDS)")
 
     jp.log("  top picks:")
     for tile in selector.rank(tiles)[:10]:
         jp.log(f"    {tile.task_id:>8} {tile.points:>4}pt "
                f"score={tile.score:.3f} heat={tile.heat:.2f} "
-               f"avail={tile.availability:.2f} {tile.category}")
+               f"avail={tile.availability:.2f} surv={tile.survival:.2f} "
+               f"{tile.category}")
 
     hottest = [(k, h) for k, h in selector.watcher.hottest(5)
                if h.drain_per_min > 0]
@@ -490,27 +639,30 @@ def _report(selector: TierPrioritySelector) -> None:
                    f"{history.remaining}/{history.total} left")
 
 
-def main() -> None:
+async def main() -> None:
     config = AgentConfig.from_env()
     selector = TierPrioritySelector(config)
     watch = "--watch" in sys.argv
 
-    while True:
-        try:
-            _report(selector)
-        except jp.AuthError:
-            raise
-        except Exception as e:                              # noqa: BLE001
-            jp.log(f"scout: board read failed, retrying — {e!r}")
-        if not watch:
-            return
-        jp.log("---")
-        time.sleep(10)
+    try:
+        while True:
+            try:
+                await _report(selector)
+            except jp.AuthError:
+                raise
+            except Exception as e:                          # noqa: BLE001
+                jp.log(f"scout: board read failed, retrying — {e!r}")
+            if not watch:
+                return
+            jp.log("---")
+            await asyncio.sleep(10)
+    finally:
+        await jp.aclose()
 
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except KeyboardInterrupt:
         pass
     except jp.AuthError as e:

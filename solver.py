@@ -7,9 +7,10 @@ code, or open a page — so it hallucinated confident, wrong answers.
 ``NaiveSolver`` gives the model hands (``tools.py``) and a loop: it can read
 the files, compute, and probe web endpoints, feeding each result back until it
 has a real answer. It is async so many tiles can be IN FLIGHT at once —
-solving has no rate limit, only submitting does — and each solve's model
-calls and tool runs (subprocess, HTTP) are awaited without blocking the
-others. Two things protect the score:
+solving has no rate limit, only submitting does — and every call it makes is
+natively awaitable: model calls (AsyncAnthropic), game API calls (httpx),
+web probes (httpx), and code execution (asyncio subprocess). No tile ever
+blocks another one's turn. Two things protect the score:
 
 - **Structural answer pass-through.** The model computes the answer in
   ``run_python`` and prints ``__ANSWER__=<value>``; that captured string is
@@ -25,8 +26,6 @@ across every tile solving concurrently.
 """
 from __future__ import annotations
 
-import asyncio
-import os
 import pathlib
 from typing import TYPE_CHECKING
 
@@ -39,18 +38,6 @@ from tools import TOOL_SCHEMAS, Toolbox
 
 if TYPE_CHECKING:                    # avoid a hard runtime dependency
     from strategy import ClaimWatch, TileBook
-
-
-def _async_anthropic_client():
-    """An AsyncAnthropic client pointed at the same proxy as jp.anthropic_client().
-
-    Built here (not in jeopardy.py) purely so many tiles can await model
-    calls concurrently; same env vars, same proxy, same forced model.
-    """
-    from anthropic import AsyncAnthropic
-    return AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", jp.KEY),
-                          base_url=os.environ.get("ANTHROPIC_BASE_URL",
-                                                  f"{jp.BASE}/anthropic"))
 
 
 class NaiveSolver:
@@ -88,9 +75,9 @@ class NaiveSolver:
             raise
 
     async def _solve(self, task_id: str, trace: TraceRecord | None = None) -> bool:
-        detail = await asyncio.to_thread(jp.task, task_id)
+        detail = await jp.task(task_id)
         workdir = jp.workdir(task_id)          # stable; see jeopardy.workdir
-        names = await asyncio.to_thread(jp.fetch_files, task_id, detail)
+        names = await jp.fetch_files(task_id, detail)
 
         if trace is not None:
             trace.category = detail.get("category")
@@ -102,7 +89,10 @@ class NaiveSolver:
                    f"{detail.get('points')}pt) prompt:\n{prompt}\n---")
 
         tools = Toolbox(workdir)
-        answer, turns = await self._run_loop(task_id, prompt, tools)
+        try:
+            answer, turns = await self._run_loop(task_id, prompt, tools)
+        finally:
+            await tools.aclose()
         if trace is not None:
             trace.turns_taken = turns
             trace.answered = answer is not None
@@ -111,6 +101,15 @@ class NaiveSolver:
             jp.log(f"{task_id}: no answer ({reason}, {turns} turns)")
             if self._book is not None:
                 self._book.record_abandon(task_id, reason=reason)
+            return False
+
+        # Last check before spending a submission slot: the mid-loop check
+        # only covers the time up to the turn that produced this answer —
+        # someone else (or another worker of ours) may have solved it since.
+        if self._claims is not None and await self._claims.is_taken(task_id):
+            jp.log(f"{task_id}: solved elsewhere before we submitted, skipping")
+            if self._book is not None:
+                self._book.record_result(task_id, {"result": "already_claimed"})
             return False
 
         return await self._submit(task_id, answer)
@@ -165,7 +164,7 @@ class NaiveSolver:
         messages: list[dict] = [{"role": "user", "content": prompt}]
 
         for turn in range(self.MAX_TURNS):
-            if self._claims is not None and self._claims.is_taken(task_id):
+            if self._claims is not None and await self._claims.is_taken(task_id):
                 jp.log(f"{task_id}: claimed elsewhere mid-solve, dropping")
                 return None, turn
 
@@ -198,9 +197,10 @@ class NaiveSolver:
                         "run_python and print '__ANSWER__=<value>' first."))
                     continue
 
-                # tools.run is blocking (subprocess/HTTP) — off the event
-                # loop so other tiles' turns keep making progress meanwhile.
-                out = await asyncio.to_thread(tools.run, tu.name, tu.input or {})
+                # Awaited, not thread-offloaded: the subprocess and the HTTP
+                # session are natively async, so other tiles' turns keep
+                # making progress meanwhile.
+                out = await tools.run(tu.name, tu.input or {})
                 if self._config.verbose:
                     jp.log(f"{task_id} turn {turn}: {tu.name} -> {out[:200]!r}")
                 results.append(self._tool_result(tu.id, out))
@@ -240,5 +240,5 @@ class NaiveSolver:
     def _anthropic(self):
         # Built on first use so a pass that picks no tiles needs no client.
         if self._client is None:
-            self._client = _async_anthropic_client()
+            self._client = jp.anthropic_client()
         return self._client

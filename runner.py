@@ -23,6 +23,9 @@ from tile_selector import TileSelector
 class AgentRunner:
     """Reads the board, picks tiles, attempts them all concurrently."""
 
+    BOARD_POLL_SECONDS = 10.0     # how often to recheck an empty board
+    BATCH_SIZE = 2                 # tiles in flight at once, not the whole pass
+
     def __init__(self, config: AgentConfig, selector: TileSelector | None = None,
                  solver: NaiveSolver | None = None,
                  submission_queue: SubmissionQueue | None = None) -> None:
@@ -37,29 +40,69 @@ class AgentRunner:
             claims=getattr(self._selector, "claims", None))
 
     async def run(self) -> int:
-        """Attempt this pass's tiles. Returns how many were solved."""
-        board = jp.board()
+        """Attempt this pass's tiles. Returns how many were solved.
+
+        Blocks (polling the board) until at least one tile is open — setup
+        phase, a gap between rounds, and a fully-solved board all look like
+        an empty pass, and an unattended agent that just exits on any of them
+        donates the rest of the round.
+        """
+        board = await self._await_open_board()
         self._log_board(board)
 
         tiles = self._selector.select(board)
         if not tiles:
-            jp.log("nothing open — is the board live yet?")
+            # TASK_FILTER named tiles that aren't open right now — the
+            # selector already logged which ones. Nothing to poll for.
+            jp.log("selector picked nothing from an open board — done")
             return 0
-        jp.log(f"attempting {len(tiles)} of them, concurrently: {tiles}")
+        jp.log(f"attempting {len(tiles)} of them, in batches of "
+               f"{self.BATCH_SIZE}: {tiles}")
 
         await self._queue.start()
         try:
-            results = await asyncio.gather(
-                *(self._attempt(task_id) for task_id in tiles))
+            solved = 0
+            for i in range(0, len(tiles), self.BATCH_SIZE):
+                batch = tiles[i:i + self.BATCH_SIZE]
+                jp.log(f"batch {i // self.BATCH_SIZE + 1}: {batch}")
+                results = await asyncio.gather(
+                    *(self._attempt(task_id) for task_id in batch))
+                solved += sum(results)
         finally:
             await self._queue.stop()
 
-        solved = sum(results)
         jp.log(f"{solved}/{len(tiles)} attempted tiles solved")
         if solved == 0:
             jp.log("Exactly as expected. Now go build an agent — read the "
                    "docstring at the top of main.py.")
         return solved
+
+    async def _await_open_board(self) -> dict:
+        """Poll `/api/board` until it has at least one open tile.
+
+        Covers setup phase, the gap between rounds, and a board this agent
+        has cleared out — all read as "zero open tiles" and none of them mean
+        stop. Only `AuthError` (a bad key) is fatal; anything else (a
+        transient read failure) is logged and retried on the same cadence.
+        """
+        logged_waiting = False
+        while True:
+            try:
+                board = await jp.board()
+            except jp.AuthError:
+                raise                                  # fatal; fix the key
+            except Exception as e:                     # noqa: BLE001
+                jp.log(f"board read failed, retrying — {e!r}")
+                await asyncio.sleep(self.BOARD_POLL_SECONDS)
+                continue
+
+            if jp.open_tiles(board):
+                return board
+            if not logged_waiting:
+                jp.log(f"phase={board.get('phase')}: no open tiles — "
+                       f"polling every {self.BOARD_POLL_SECONDS:.0f}s")
+                logged_waiting = True
+            await asyncio.sleep(self.BOARD_POLL_SECONDS)
 
     async def _attempt(self, task_id: str) -> bool:
         with MONITOR.trace(task_id) as trace:

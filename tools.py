@@ -9,18 +9,24 @@ login. These two tools are the minimum that changes that:
   ``__ANSWER__=<value>`` so a computed answer can be submitted verbatim,
   without the model ever re-typing it (the transcription-slip the README
   warns about).
-- ``http_request`` is one persistent ``requests.Session`` per tile, so
+- ``http_request`` is one persistent ``httpx.AsyncClient`` per tile, so
   cookies, redirects and login state survive across calls — the whole point
   of the stateful-web category.
+
+Both are coroutines, and neither blocks the event loop: the subprocess is
+spawned with ``asyncio.create_subprocess_exec`` and awaited, so a tile
+grinding through a 120-second brute force does not freeze the dozen other
+tiles solving alongside it. Toolboxes own a connection pool, so ``aclose()``
+when the tile is done.
 """
 from __future__ import annotations
 
+import asyncio
 import pathlib
-import subprocess
 import sys
 import traceback
 
-import requests
+import httpx
 
 
 ANSWER_SENTINEL = "__ANSWER__="
@@ -38,7 +44,7 @@ TOOL_SCHEMAS = [
             "and to COMPUTE the answer. When you have the final answer, print "
             "it on its own line as '" + ANSWER_SENTINEL + "<value>' — that "
             "exact string is captured verbatim so you never have to retype "
-            "it. Packages available: numpy, pandas, requests, "
+            "it. Packages available: numpy, pandas, requests, httpx, "
             "beautifulsoup4, lxml, plus the stdlib."
         ),
         "input_schema": {
@@ -98,41 +104,63 @@ class Toolbox:
     the last value a ``run_python`` call marked with the answer sentinel.
     """
 
+    PYTHON_TIMEOUT = 120.0     # bounds a stuck search
+    HTTP_TIMEOUT = 60.0
+
     def __init__(self, workdir: pathlib.Path) -> None:
         self._workdir = workdir
-        self._session = requests.Session()
+        self._client = httpx.AsyncClient(timeout=self.HTTP_TIMEOUT)
         self.computed_answer: str | None = None
 
-    def run(self, name: str, args: dict) -> str:
+    async def aclose(self) -> None:
+        """Release this tile's connections. One pool per tile, and a board is
+        hundreds of tiles wide — leaked pools exhaust the process's sockets."""
+        await self._client.aclose()
+
+    async def run(self, name: str, args: dict) -> str:
         """Dispatch one tool call. Never raises — errors come back as text
         the model can read and react to."""
         try:
             if name == "run_python":
-                return self._run_python(args.get("code", ""))
+                return await self._run_python(args.get("code", ""))
             if name == "http_request":
-                return self._http_request(args)
+                return await self._http_request(args)
             return f"[error] unknown tool {name!r}"
         except Exception:                                      # noqa: BLE001
             return "[error]\n" + _truncate(traceback.format_exc())
 
     # -- run_python --------------------------------------------------------
 
-    def _run_python(self, code: str) -> str:
+    async def _run_python(self, code: str) -> str:
         """Run code in a subprocess rooted at the tile's workdir.
 
         A subprocess (not exec in-process) so a crash, an infinite import, or
-        a huge allocation takes down a child, not the agent. Timeout bounds a
-        stuck search.
+        a huge allocation takes down a child, not the agent. Awaited rather
+        than waited on, so the other tiles in flight keep their turns moving
+        while this one computes. Timeout bounds a stuck search.
         """
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", code,
             cwd=str(self._workdir),
-            capture_output=True,
-            text=True,
-            timeout=120,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        out = proc.stdout or ""
-        err = proc.stderr or ""
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=self.PYTHON_TIMEOUT)
+        except (TimeoutError, asyncio.TimeoutError):
+            await _kill(proc)
+            return (f"[error] run_python timed out after "
+                    f"{self.PYTHON_TIMEOUT:.0f}s and was killed. Narrow the "
+                    f"search or process the file in chunks.")
+        except asyncio.CancelledError:
+            # The tile was dropped (claimed elsewhere). Don't leave the child
+            # running — nothing will ever reap it.
+            await _kill(proc)
+            raise
+
+        out = stdout.decode("utf-8", "replace")
+        err = stderr.decode("utf-8", "replace")
 
         for line in out.splitlines():
             if line.startswith(ANSWER_SENTINEL):
@@ -151,24 +179,32 @@ class Toolbox:
 
     # -- http_request ------------------------------------------------------
 
-    def _http_request(self, args: dict) -> str:
+    async def _http_request(self, args: dict) -> str:
         method = (args.get("method") or "GET").upper()
         url = args["url"]
-        r = self._session.request(
+        r = await self._client.request(
             method,
             url,
             headers=args.get("headers"),
             params=args.get("params"),
             data=args.get("data"),
             json=args.get("json"),
-            allow_redirects=args.get("allow_redirects", True),
-            timeout=60,
+            follow_redirects=args.get("allow_redirects", True),
         )
         body = r.text or ""
         header_lines = "\n".join(f"{k}: {v}" for k, v in r.headers.items())
         return _truncate(
-            f"HTTP {r.status_code} {r.reason}\n"
+            f"HTTP {r.status_code} {r.reason_phrase}\n"
             f"final URL: {r.url}\n"
             f"headers:\n{header_lines}\n\n"
             f"body:\n{body}"
         )
+
+
+async def _kill(proc: asyncio.subprocess.Process) -> None:
+    """Kill a child and reap it, tolerating one that already exited."""
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    await proc.wait()

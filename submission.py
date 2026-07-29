@@ -79,7 +79,7 @@ class SubmissionQueue:
                 await asyncio.sleep(wait)
             self._last_submit = time.monotonic()
 
-            result = await asyncio.to_thread(jp.submit, task_id, answer)
+            result = await jp.submit(task_id, answer)
             if result.get("result") != "rate_limited":
                 return result
             if attempt == self.MAX_RATE_LIMIT_RETRIES:

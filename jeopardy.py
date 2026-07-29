@@ -6,6 +6,14 @@ agent, not on multipart uploads.
 
 Everything you need is configured from four env vars (see .env.example).
 
+EVERY NETWORK CALL HERE IS A COROUTINE — `await jp.board()`, not `jp.board()`.
+One shared `httpx.AsyncClient` (connection-pooled, keep-alive) backs all of
+them, so dozens of tiles can have board reads, task fetches and downloads in
+flight at once without a thread per call. `httpx` is used rather than
+`aiohttp` because it is preinstalled in the hosted image and the runtime
+sandbox has no internet to install anything else. Call `await jp.aclose()`
+on the way out to close the pool.
+
 SHIP THIS FILE. It is NOT preinstalled in the hosted agent image, so a
 submission that is a bare main.py doing `import jeopardy` deploys fine and
 then dies with ModuleNotFoundError. Submit a zip that contains both files:
@@ -14,12 +22,13 @@ then dies with ModuleNotFoundError. Submit a zip that contains both files:
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import pathlib
 import tempfile
 import time
 
-import requests
+import httpx
 
 BASE = os.environ.get("JEOPARDY_BASE_URL", "").rstrip("/")
 KEY = os.environ.get("TEAM_API_KEY", "")
@@ -28,8 +37,36 @@ if not BASE or not KEY:
         "Set JEOPARDY_BASE_URL and TEAM_API_KEY first (see .env.example).\n"
         "Get them from /join on the event site.")
 
-_s = requests.Session()
-_s.headers["X-Api-Key"] = KEY
+_client: httpx.AsyncClient | None = None
+
+
+def client() -> httpx.AsyncClient:
+    """The shared async HTTP client, built on first use.
+
+    Lazily, and not at import time: an AsyncClient binds its connection pool
+    to the running event loop, and one constructed at import belongs to no
+    loop at all. The pool is sized for the width of the board — every open
+    tile is workable at once, and a default-sized pool would quietly serialise
+    them behind a handful of connections.
+    """
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(
+            headers={"X-Api-Key": KEY},
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            limits=httpx.Limits(max_connections=100,
+                                max_keepalive_connections=50),
+            follow_redirects=True,
+        )
+    return _client
+
+
+async def aclose() -> None:
+    """Close the shared client. Safe to call more than once."""
+    global _client
+    if _client is not None and not _client.is_closed:
+        await _client.aclose()
+    _client = None
 
 
 # ---------------------------------------------------------------- errors
@@ -86,7 +123,7 @@ def _raise_for(r, what: str, unavailable: tuple[int, ...] = ()) -> None:
                         f"(sent a {len(KEY)}-char key starting {KEY[:5]!r})")
     if r.status_code in unavailable:
         raise TileUnavailable(f"{what}: {r.status_code} — {_detail(r)}")
-    if not r.ok:
+    if not r.is_success:
         raise JeopardyError(f"{what}: HTTP {r.status_code} — {_detail(r)}")
 
 
@@ -103,7 +140,7 @@ def _json(r, what: str, unavailable: tuple[int, ...] = ()) -> dict:
 
 # ---------------------------------------------------------------- game state
 
-def board() -> dict:
+async def board() -> dict:
     """Whole board: phase, categories, tiles, claims, scoreboard.
 
     Each entry in `boards[<board>][i]["tiles"]` is a CELL, not a tile: one
@@ -123,7 +160,8 @@ def board() -> dict:
     correctly. Practice tiles never lock, so this is how you avoid paying to
     solve the same tile twice after a redeploy.
     """
-    b = _json(_s.get(f"{BASE}/api/board", timeout=30), "GET /api/board")
+    r = await client().get(f"{BASE}/api/board", timeout=30)
+    b = _json(r, "GET /api/board")
     if "you" not in b:
         # This endpoint takes no auth, so a bad key still returns a flawless
         # board. The `you` block is added only for a key the server
@@ -135,8 +173,11 @@ def board() -> dict:
 _PHASE_BOARD = {"practice": "practice", "round1": "qual", "game": "main"}
 
 
-def live_board(b: dict | None = None) -> str:
+def live_board(b: dict) -> str:
     """Which board is actually PLAYABLE right now: "practice"|"qual"|"main".
+
+    Takes an already-fetched board (`await board()`) so it stays a pure
+    function — no hidden request behind a synchronous-looking call.
 
     Chosen from `phase`, not from which boards happen to be present. A board
     stays in the payload once its round has started, so after Round 1 you
@@ -145,7 +186,6 @@ def live_board(b: dict | None = None) -> str:
     that EXISTS therefore hands you tiles whose every submission comes back
     `{"result": "wrong_phase"}` during exactly the hour you meant to practise.
     """
-    b = b or board()
     boards = b.get("boards", {})
     want = _PHASE_BOARD.get(b.get("phase") or "")
     if want in boards:
@@ -154,9 +194,13 @@ def live_board(b: dict | None = None) -> str:
                 "practice")
 
 
-def open_tiles(b: dict | None = None) -> list[dict]:
+def open_tiles(b: dict) -> list[dict]:
     """EVERY open tile on the board that is playable right now (`live_board`),
     richest first.
+
+    Takes an already-fetched board (`await board()`). Pure and synchronous on
+    purpose: it is called from ranking and claim-checking code on every tool
+    turn, and a hidden network call in there would stall the event loop.
 
     One dict per VARIANT, not per cell: a copy of the cell's card with `id`
     replaced by that variant's own id, plus `category` (the board payload puts
@@ -176,7 +220,6 @@ def open_tiles(b: dict | None = None) -> list[dict]:
     (the leading variants of a cell are the ones it pre-generates, so they
     answer fastest). It is a starting heuristic and a bad one — see the README.
     """
-    b = b or board()
     solved = set((b.get("you") or {}).get("solved_ids") or [])
     out: list[dict] = []
     for cat in b.get("boards", {}).get(live_board(b), []):
@@ -194,15 +237,15 @@ def open_tiles(b: dict | None = None) -> list[dict]:
     return sorted(out, key=lambda t: -t.get("points", 0))
 
 
-def task(task_id: str) -> dict:
+async def task(task_id: str) -> dict:
     """Prompt, file list, points, and `answer_format` (how the checker
     compares your answer — worth telling your model).
 
     Raises TileUnavailable if the row is still locked or the board isn't live
     yet; that is a game state, so catch it and pick another tile.
     """
-    return _json(_s.get(f"{BASE}/api/task/{task_id}", timeout=30),
-                 f"GET /api/task/{task_id}", unavailable=(403, 404))
+    r = await client().get(f"{BASE}/api/task/{task_id}", timeout=30)
+    return _json(r, f"GET /api/task/{task_id}", unavailable=(403, 404))
 
 
 def workdir(task_id: str) -> pathlib.Path:
@@ -219,33 +262,43 @@ def workdir(task_id: str) -> pathlib.Path:
     return d
 
 
-def fetch_files(task_id: str, detail: dict,
-                dest: str | pathlib.Path | None = None) -> list[str]:
+async def fetch_files(task_id: str, detail: dict,
+                      dest: str | pathlib.Path | None = None) -> list[str]:
     """Download a task's files. Returns the filenames.
 
     Defaults to `workdir(task_id)` and SKIPS anything already downloaded: your
     materials are generated deterministically from your team id, so they never
     change and a second call costs nothing. Re-pulling them every turn is pure
     waste — for you and for the server everyone else is sharing.
+
+    A tile's files are pulled concurrently; the heaviest are ~4.7 MB and
+    fetching them one after another is dead time on the only clock that
+    matters.
     """
     out = pathlib.Path(dest) if dest is not None else workdir(task_id)
     out.mkdir(parents=True, exist_ok=True)
-    names = []
-    for name in detail.get("files", []):
-        path = out / name
-        if not path.exists() or path.stat().st_size == 0:
-            r = _s.get(f"{BASE}/api/task/{task_id}/file/{name}", timeout=120)
-            # Checked, because r.content on an error is a JSON error blob —
-            # unchecked, this wrote `{"detail": "Invalid API key"}` to disk as
-            # your 4 MB log file and let the model "solve" that instead.
-            _raise_for(r, f"GET /api/task/{task_id}/file/{name}",
-                       unavailable=(403, 404))
-            path.write_bytes(r.content)
-        names.append(name)
+    names = list(detail.get("files", []))
+    await asyncio.gather(*(_fetch_one(task_id, name, out / name)
+                           for name in names))
     return names
 
 
-def submit(task_id: str, answer: str) -> dict:
+async def _fetch_one(task_id: str, name: str, path: pathlib.Path) -> None:
+    if path.exists() and path.stat().st_size:
+        return
+    r = await client().get(f"{BASE}/api/task/{task_id}/file/{name}",
+                           timeout=httpx.Timeout(120.0, connect=10.0))
+    # Checked, because r.content on an error is a JSON error blob —
+    # unchecked, this wrote `{"detail": "Invalid API key"}` to disk as
+    # your 4 MB log file and let the model "solve" that instead.
+    _raise_for(r, f"GET /api/task/{task_id}/file/{name}",
+               unavailable=(403, 404))
+    # Disk has no async API in the stdlib, and a multi-megabyte write is long
+    # enough to be felt by every other tile sharing this loop.
+    await asyncio.to_thread(path.write_bytes, r.content)
+
+
+async def submit(task_id: str, answer: str) -> dict:
     """Submit an answer.
 
     Returns {"result": "correct" | "incorrect" | "already_claimed" |
@@ -255,10 +308,10 @@ def submit(task_id: str, answer: str) -> dict:
     raises. Wrong answers on scored tiles cost points and trigger a doubling
     cooldown, so submit deliberately.
     """
-    res = _json(_s.post(f"{BASE}/api/submit",
-                        json={"task_id": task_id, "answer": str(answer)},
-                        timeout=30),
-                f"POST /api/submit {task_id}")
+    r = await client().post(f"{BASE}/api/submit",
+                            json={"task_id": task_id, "answer": str(answer)},
+                            timeout=30)
+    res = _json(r, f"POST /api/submit {task_id}")
     if "result" not in res:
         raise JeopardyError(f"POST /api/submit {task_id}: no `result` field in "
                             f"{res!r} — that is not a scoring bug, the call "
@@ -266,24 +319,27 @@ def submit(task_id: str, answer: str) -> dict:
     return res
 
 
-def me() -> dict:
+async def me() -> dict:
     """Your team, LLM usage, and remaining budget."""
-    return _json(_s.get(f"{BASE}/api/me", timeout=30), "GET /api/me")
+    return _json(await client().get(f"{BASE}/api/me", timeout=30),
+                 "GET /api/me")
 
 
 # ---------------------------------------------------------------- the model
 
 def anthropic_client():
-    """An Anthropic SDK client pointed at the event proxy.
+    """An AsyncAnthropic SDK client pointed at the event proxy.
 
-    The proxy forces one model for everyone regardless of what you request,
-    and your agent's sandbox has no other network access — so this is the
-    only model you get. The competition is what you build around it.
+    Async so many tiles can have model calls in flight at once — thinking has
+    no rate limit, only submitting does. The proxy forces one model for
+    everyone regardless of what you request, and your agent's sandbox has no
+    other network access — so this is the only model you get. The competition
+    is what you build around it.
     """
-    from anthropic import Anthropic
-    return Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", KEY),
-                     base_url=os.environ.get("ANTHROPIC_BASE_URL",
-                                             f"{BASE}/anthropic"))
+    from anthropic import AsyncAnthropic
+    return AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", KEY),
+                          base_url=os.environ.get("ANTHROPIC_BASE_URL",
+                                                  f"{BASE}/anthropic"))
 
 
 MODEL = os.environ.get("MODEL", "claude-haiku-4-5")

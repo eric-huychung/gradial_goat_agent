@@ -76,7 +76,10 @@ from runner import AgentRunner
 
 
 async def main() -> None:
-    await AgentRunner(AgentConfig.from_env()).run()
+    try:
+        await AgentRunner(AgentConfig.from_env()).run()
+    finally:
+        await jp.aclose()
 
 
 if __name__ == "__main__":

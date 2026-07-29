@@ -171,20 +171,26 @@ when it counts.
 
 You can browse and download all of them right now, two ways:
 
-**In Python (via `jeopardy.py`):**
+**In Python (via `jeopardy.py`):** every call that touches the network is a
+coroutine, so run them inside `asyncio.run`:
 
 ```python
+import asyncio
 import jeopardy as jp
 
-b = jp.board()                       # b["boards"]["practice"] lists the CELLS
-tiles = jp.open_tiles(b)             # every open TILE — 60 here, not 30
-print(len(tiles), [t["id"] for t in tiles])
+async def peek():
+    b = await jp.board()             # b["boards"]["practice"] lists the CELLS
+    tiles = jp.open_tiles(b)         # every open TILE — 60 here, not 30
+    print(len(tiles), [t["id"] for t in tiles])
 
-detail = jp.task("PR-A1")            # {prompt, files, points, answer_format, ...}
-print(detail["prompt"], detail["files"])
+    detail = await jp.task("PR-A1")  # {prompt, files, points, answer_format, ...}
+    print(detail["prompt"], detail["files"])
 
-jp.fetch_files("PR-A1", detail)      # -> jp.workdir("PR-A1"), skips re-downloads
-jp.me()                              # your LLM usage + rate-limit status
+    await jp.fetch_files("PR-A1", detail)  # -> jp.workdir("PR-A1"), skips re-downloads
+    print(await jp.me())             # your LLM usage + rate-limit status
+    await jp.aclose()                # close the shared connection pool
+
+asyncio.run(peek())
 ```
 
 **With `curl`** (same endpoints, if you just want the raw bytes on disk):
