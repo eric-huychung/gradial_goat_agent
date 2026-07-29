@@ -57,124 +57,24 @@ WHAT AN AGENT NEEDS THAT THIS DOESN'T HAVE
    crypto tile" and brings the right tools and prompt to it.
 
 Check your budget any time with `jeopardy.me()`.
+
+WHERE THINGS LIVE
+-----------------
+    config.py         the three dev knobs, read from the environment
+    tile_selector.py  which tiles a pass attempts — the strategy
+    solver.py         one tile: prompt, model call, submit
+    runner.py         one pass over the board
 """
 from __future__ import annotations
 
-import os
-import time
-
 import jeopardy as jp
 
-# ---- dev knobs, read by THIS file (see .env.example) ----------------------
-# Three, and all three work. If you rewrite main.py they are yours to keep or
-# drop — but don't leave a knob documented that the code ignores.
-
-# Print the prompt, the model's full reply, and the raw submit response.
-VERBOSE = os.environ.get("VERBOSE") == "1"
-# Attempt exactly these tiles, in this order, ignoring MAX_TILES.
-# e.g. TASK_FILTER=PR-H5,PR-W5 for the Heavy Compute and Dark Web 500s.
-TASK_FILTER = [t.strip() for t in os.environ.get("TASK_FILTER", "").split(",")
-               if t.strip()]
-# How many tiles one run attempts when TASK_FILTER is empty.
-MAX_TILES = int(os.environ.get("MAX_TILES", "3"))
-
-
-def naive_attempt(task_id: str) -> bool:
-    """One model call. No tools. The floor you are trying to beat."""
-    detail = jp.task(task_id)
-    workdir = jp.workdir(task_id)          # stable; see jeopardy.workdir
-    names = jp.fetch_files(task_id, detail)
-
-    prompt = (
-        f"{detail['prompt']}\n\n"
-        f"Files downloaded to {workdir}: {names or 'none'}\n"
-        f"Answer checking: {detail.get('answer_format', 'exact')}\n\n"
-        "Reply with ONLY the final answer — no working, no explanation."
-    )
-    if VERBOSE:
-        jp.log(f"{task_id} ({detail.get('category')}, {detail.get('points')}pt)"
-               f" prompt:\n{prompt}\n---")
-
-    client = jp.anthropic_client()
-    resp = client.messages.create(
-        model=jp.MODEL, max_tokens=1000,
-        messages=[{"role": "user", "content": prompt}])
-    answer = "".join(b.text for b in resp.content if b.type == "text").strip()
-    if VERBOSE:
-        jp.log(f"{task_id} model replied:\n{answer}\n---")
-
-    result = jp.submit(task_id, answer)
-    jp.log(f"{task_id}: answered {answer[:60]!r} -> {result.get('result')}")
-    if VERBOSE:
-        jp.log(f"{task_id} full submit response: {result}")
-    if result.get("result") == "forbidden":
-        jp.log("  (a scored round is live — only your HOSTED agent may "
-               "submit. Deploy with /api/agent/submit, or practise on the "
-               "practice board.)")
-    return result.get("result") == "correct"
-
-
-def pick_tiles(b: dict) -> list[str]:
-    """Which tiles this one pass attempts. Replace me — this is the strategy.
-
-    `jp.open_tiles()` hands back EVERY open variant, because every one of them
-    is claimable right now and a real agent works them in parallel. A baseline
-    with no tools and no loop must not walk that list: at one submission per
-    three seconds, a few hundred tiles is the whole event spent proving the
-    same thing. So: one tile per cell — a spread of different tasks rather
-    than eight clones of one — capped at MAX_TILES.
-
-    Using the full width instead of throwing it away is most of the hackathon.
-    """
-    tiles = jp.open_tiles(b)
-    if TASK_FILTER:
-        open_now = {t["id"] for t in tiles}
-        missing = [t for t in TASK_FILTER if t not in open_now]
-        if missing:
-            jp.log(f"TASK_FILTER: not open right now, skipping {missing}")
-        return [t for t in TASK_FILTER if t in open_now]
-    picked: list[str] = []
-    seen_cells: set[tuple] = set()
-    for t in tiles:
-        cell = (t.get("category"), t.get("points"))
-        if cell in seen_cells:
-            continue                # already sampling this cell's task
-        seen_cells.add(cell)
-        picked.append(t["id"])
-        if len(picked) >= MAX_TILES:
-            break
-    return picked
+from config import AgentConfig
+from runner import AgentRunner
 
 
 def main() -> None:
-    b = jp.board()
-    every = jp.open_tiles(b)
-    cells = {(t.get("category"), t.get("points")) for t in every}
-    jp.log(f"phase={b.get('phase')}: {len(every)} open tiles across "
-           f"{len(cells)} cells — all of them claimable in parallel")
-    tiles = pick_tiles(b)
-    if not tiles:
-        jp.log("nothing open — is the board live yet?")
-        return
-    jp.log(f"naive baseline is attempting {len(tiles)} of them, serially: "
-           f"{tiles}")
-
-    solved = 0
-    for task_id in tiles:
-        try:
-            solved += naive_attempt(task_id)
-        except jp.AuthError:
-            raise                                  # fatal; fix the key
-        except jp.TileUnavailable as e:
-            jp.log(f"{task_id}: not available — {e}")
-        except Exception as e:                     # noqa: BLE001
-            jp.log(f"{task_id}: blew up — {e!r}")
-        time.sleep(4)                              # submission rate limit
-
-    jp.log(f"naive baseline: {solved}/{len(tiles)} attempted tiles solved")
-    if solved == 0:
-        jp.log("Exactly as expected. Now go build an agent — read the "
-               "docstring at the top of this file.")
+    AgentRunner(AgentConfig.from_env()).run()
 
 
 if __name__ == "__main__":
